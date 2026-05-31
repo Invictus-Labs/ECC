@@ -168,3 +168,88 @@ tests/           — Test suite
 - Code is readable and maintainable
 - Performance is acceptable
 - User requirements are met
+
+---
+
+# Codebase Map for AI Agents
+
+This section is the territory map for an agent working *on this repository's own code* (as
+opposed to the agents shipped for end users above). See `docs/architecture.md` for the full
+system model and `docs/decisions/` for ADRs.
+
+## File-territory map
+
+| Territory | Path | Nature |
+|---|---|---|
+| Harness content (data) | `skills/`, `agents/`, `commands/`, `rules/`, `contexts/`, `mcp-configs/` | Markdown/JSON, never executed by ECC; validated by CI |
+| Install declarations | `manifests/` | Data; source of truth for what installs |
+| Schemas | `schemas/` | JSON Schemas that gate the data layer |
+| Installer / operator CLI | `scripts/`, `scripts/lib/` | Node.js code (the main executable surface) |
+| Content validators | `scripts/ci/` | Node.js code — the CI gate |
+| Hook handlers | `scripts/hooks/` (logic) + `hooks/` (JSON config) | Node.js code + config |
+| Python LLM layer | `src/llm/` | Python code |
+| Rust control plane | `ecc2/` | Rust code (alpha, isolated) |
+| Operator dashboard | `ecc_dashboard.py` | Python code |
+| Integrations | `integrations/` | Opt-in Python adapters (e.g. AURA) |
+| Tests | `tests/` (+ `tests/test_*.py`) | JS + Python tests |
+
+Every source directory has a `CLAUDE.md` with its own deep map.
+
+## Safe-to-modify zones (normal PR review)
+
+- Adding a skill/agent/command/rule (then `npm run catalog:sync` + `command-registry:write`).
+- Adding a new harness adapter in `scripts/lib/install-targets/` + a registry entry.
+- Adding an LLM provider in `src/llm/providers/` + `register_provider`.
+- Adding tests anywhere; improving docs.
+- `ecc2/` changes (alpha — isolated from the stable installer).
+
+## Require-human-review zones
+
+- **`schemas/` + `manifests/`** — changing a schema can invalidate existing data; change
+  schema + data + any state-store migration together.
+- **`scripts/lib/state-store/`** — install-state persistence; schema changes need migrations.
+- **`hooks/hooks.json` + `scripts/hooks/`** — guardrails that gate user tool calls; the
+  plugin-root bootstrap is deliberately verbose, do not "simplify" it.
+- **`scripts/ci/`** — these validators are the security/quality gate; weakening them is a
+  trust decision (especially `check-unicode-safety.js`, `scan-supply-chain-iocs.js`,
+  `validate-no-personal-paths.js`).
+- **`integrations/aura/`** — security boundary; fail-open vs fail-closed is a real decision
+  (see `THREAT_MODEL.md`).
+- **`mcp-configs/`** — never commit real credentials (placeholders only).
+- **Release/CI workflows** (`.github/workflows/`, `release-approval-gate.js`).
+
+## Testing strategy
+
+- **Always run `npm test` before pushing** — it runs the content validators, catalog +
+  command-registry consistency checks, then `tests/run-all.js`. A content lint failure
+  surfaces here, not at runtime.
+- Python: `pytest -q` (mock SDKs/network in provider tests).
+- Rust: `cd ecc2 && cargo test`.
+- Coverage floors: JS 80% on `scripts/**` (`npm run coverage`); Python `pytest-cov` on `src/llm`.
+- Bug fixes ship a regression test first.
+
+## Common-task playbook
+
+- **Add a slash command:** create `commands/<name>.md` (with `description` frontmatter) →
+  `npm run command-registry:write` → `npm test`.
+- **Add a skill:** create `skills/<name>/SKILL.md` (When to Use / How It Works / Examples) →
+  add to `package.json` `files` if it should ship → `npm run catalog:sync` → `npm test`.
+- **Add a harness target:** add `scripts/lib/install-targets/<harness>.js` + register in
+  `registry.js` → add a `tests/lib/*` test asserting path containment → `npm test`.
+- **Add an LLM provider:** subclass `LLMProvider` in `src/llm/providers/` → `register_provider`
+  in `resolver.py` → add `tests/test_*_provider.py` (mock the SDK) → `pytest`.
+- **Fix a bug:** reproduce, add a failing test, fix minimally, re-run the relevant suite.
+- **Add a test:** mirror the target's location under `tests/` (`tests/lib/`, `tests/ci/`,
+  `tests/test_*.py`); keep it deterministic and mocked.
+
+## Gotchas / footguns
+
+- Content is data — there is no runtime to catch a malformed file; the validators are the
+  only line of defense (ADR-006).
+- Catalog/command-registry drift fails CI's `--check` even when your content is "fine".
+- `src/llm/providers/__init__.py` imports every provider eagerly — all SDKs must be importable.
+- The package is imported as `llm`, not `src.llm` (`PYTHONPATH=src` or `pip install -e .`).
+- `ecc2/` is NOT in the npm `files` list — do not assume installer changes affect it or vice versa.
+- The hook bootstrap one-liner resolves the plugin root across several install layouts; it
+  looks redundant but each branch matters.
+- Never introduce zero-width/homoglyph unicode or personal paths — both are CI-blocked.
